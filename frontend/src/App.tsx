@@ -1,0 +1,111 @@
+import { useRef, useCallback } from "react";
+import { ScreenerForm } from "./components/ScreenerForm";
+import { ProgressBar } from "./components/ProgressBar";
+import { ResultsTable } from "./components/ResultsTable";
+import { LogPanel } from "./components/LogPanel";
+import { BackToTop } from "./components/BackToTop";
+import { HeartbeatIndicator } from "./components/HeartbeatIndicator";
+import { useScreener } from "./hooks/useScreener";
+import type { ScreenParams } from "./types";
+
+function App() {
+  const {
+    sessions,
+    results,
+    logs,
+    totalSubscribed,
+    notice,
+    heartbeat,
+    startScreening,
+    stopSession,
+    stopAll,
+    clearResults,
+  } = useScreener();
+
+  const paramsRef = useRef<Omit<ScreenParams, "symbols">>({
+    side: "put",
+    min_annual_return: 20,
+    max_dte: 70,
+    min_otm: 0.1,
+    max_abs_delta: 100,
+    min_open_interest: 1,
+    max_spread_ratio: 100,
+    min_iv_rank: 0,
+    min_pop: 0,
+    pre_market: false,
+  });
+
+  const handleSubmit = (params: ScreenParams) => {
+    startScreening(params);
+  };
+
+  const handleParamsChange = useCallback((p: Omit<ScreenParams, "symbols">) => {
+    paramsRef.current = p;
+  }, []);
+
+  const handleScreenAgain = useCallback((symbol: string) => {
+    startScreening({ ...paramsRef.current, symbols: [symbol] });
+  }, [startScreening]);
+
+  return (
+    <div className="min-h-screen bg-gray-50">
+      <header className="bg-white border-b border-gray-200 px-6 py-4">
+        <div className="max-w-7xl mx-auto flex items-center justify-between">
+          <h1 className="text-lg font-bold text-gray-900">Fat Premium Options Screener</h1>
+          <div className="flex items-center gap-3">
+            <HeartbeatIndicator heartbeat={heartbeat} />
+            {totalSubscribed > 0 && (
+              <span className="text-xs px-2.5 py-1 rounded-full bg-blue-100 text-blue-800 font-medium">
+                {totalSubscribed} live subscription{totalSubscribed > 1 ? "s" : ""}
+              </span>
+            )}
+            {sessions.length > 0 && (
+              <span className="text-xs text-gray-500">
+                {sessions.length} session{sessions.length > 1 ? "s" : ""}
+              </span>
+            )}
+            {results.length > 0 && (
+              <button
+                onClick={clearResults}
+                className="px-2 py-1 text-xs font-medium text-gray-600 bg-gray-100 rounded hover:bg-gray-200 transition-colors"
+              >
+                Clear Results
+              </button>
+            )}
+          </div>
+        </div>
+      </header>
+
+      <main className="max-w-7xl mx-auto px-6 py-6 space-y-6">
+        <ScreenerForm
+          onSubmit={handleSubmit}
+          disabled={false}
+          onParamsChange={handleParamsChange}
+          onStop={sessions.length > 0 ? stopAll : undefined}
+          stopLabel={sessions.length > 1 ? "Stop All" : "Stop"}
+        />
+
+        {notice && (
+          <div className="bg-yellow-50 border border-yellow-200 rounded-lg px-4 py-2 text-sm text-yellow-800">
+            {notice}
+          </div>
+        )}
+
+        <ProgressBar
+          sessions={sessions}
+          results={results}
+          onStop={stopSession}
+          onScreenAgain={handleScreenAgain}
+        />
+
+        <LogPanel logs={logs} />
+
+        <ResultsTable results={results} />
+      </main>
+
+      <BackToTop heartbeat={heartbeat} totalSubscribed={totalSubscribed} />
+    </div>
+  );
+}
+
+export default App;

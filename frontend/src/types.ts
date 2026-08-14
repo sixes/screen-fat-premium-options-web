@@ -52,6 +52,8 @@ export type WsMessage =
   | { type: "heartbeat"; elapsed: number; progress: number; total: number }
   | { type: "log"; message: string; level: string }
   | { type: "update"; result: ScreenResult }
+  | { type: "remove"; symbol: string }
+  | { type: "contract_found"; result: ScreenResult }
   | { type: "subscribed"; count: number }
   | { type: "skipped"; underlyings: string[] }
   | { type: "stopped"; message: string }

@@ -63,6 +63,11 @@ export function LogPanel({ logs }: Props) {
         </span>
         <span>{expanded ? "\u25BC" : "\u25B6"}</span>
       </button>
+      {!expanded && logs.length > 0 && (
+        <div className="px-4 pb-2 font-mono text-[11px] leading-relaxed truncate text-gray-400">
+          {logs[logs.length - 1].message}
+        </div>
+      )}
       {expanded && (
         <div
           ref={scrollRef}

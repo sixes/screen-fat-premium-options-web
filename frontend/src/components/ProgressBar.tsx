@@ -36,6 +36,7 @@ interface CardProps {
 function SymbolCard({ session, symbolProgress, results, onStop, onScreenAgain }: CardProps) {
   const { symbol, status, elapsed } = symbolProgress;
   const isBusy = session.state === "connecting" || session.state === "screening";
+  const isStopping = session.state === "stopping";
 
   const symbolResults = results.filter((r) => r.underlying === symbol);
   const maxAnnReturn = symbolResults.reduce(
@@ -47,6 +48,7 @@ function SymbolCard({ session, symbolProgress, results, onStop, onScreenAgain }:
   const isEmpty = isDone && symbolResults.length === 0;
 
   const displayState =
+    isStopping ? "stopping" :
     status === "screening" ? "screening" :
     isEmpty ? "0 matches" :
     isDone && session.state === "done" ? "live" :
@@ -56,13 +58,14 @@ function SymbolCard({ session, symbolProgress, results, onStop, onScreenAgain }:
 
   const stateStyles =
     displayState === "screening" ? "bg-yellow-100 text-yellow-800" :
+    displayState === "stopping" ? "bg-orange-100 text-orange-700" :
     displayState === "live" ? "bg-green-100 text-green-800" :
     displayState === "0 matches" ? "bg-gray-100 text-gray-600" :
     displayState === "done" ? "bg-green-50 text-green-700" :
     displayState === "error" ? "bg-red-100 text-red-800" :
     "bg-gray-100 text-gray-600";
 
-  const stopLabel = isBusy ? "Stop" : isEmpty ? "Dismiss" : "\u2716";
+  const stopLabel = isStopping ? "Stopping…" : isBusy ? "Stop" : isEmpty ? "Dismiss" : "\u2716";
 
   return (
     <div
@@ -107,7 +110,7 @@ function SymbolCard({ session, symbolProgress, results, onStop, onScreenAgain }:
       )}
 
       <div className="ml-auto flex items-center gap-2">
-        {isEmpty && onScreenAgain && (
+        {isEmpty && !isStopping && onScreenAgain && (
           <button
             onClick={(e) => {
               e.stopPropagation();
@@ -123,14 +126,17 @@ function SymbolCard({ session, symbolProgress, results, onStop, onScreenAgain }:
         <button
           onClick={(e) => {
             e.stopPropagation();
-            onStop(session.id);
+            if (!isStopping) onStop(session.id);
           }}
+          disabled={isStopping}
           className={`px-2 py-1 text-xs font-medium rounded transition-colors ${
-            isEmpty
+            isStopping
+              ? "text-orange-600 bg-orange-50 cursor-not-allowed opacity-60"
+              : isEmpty
               ? "text-gray-600 bg-gray-100 hover:bg-gray-200"
               : "text-red-600 bg-red-50 hover:bg-red-100"
           }`}
-          title={isBusy ? "Stop screening" : isEmpty ? "Dismiss" : "Disconnect"}
+          title={isStopping ? "Waiting for backend to stop…" : isBusy ? "Stop screening" : isEmpty ? "Dismiss" : "Disconnect"}
         >
           {stopLabel}
         </button>

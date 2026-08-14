@@ -116,6 +116,15 @@ async def handle_screen_ws(websocket: WebSocket) -> None:
         except Exception:
             pass
 
+    async def on_contract_found(result: ScreenResult) -> None:
+        try:
+            await websocket.send_json({
+                "type": "contract_found",
+                "result": result.to_dict(),
+            })
+        except Exception:
+            pass
+
     async def heartbeat():
         while not stop_event.is_set():
             await asyncio.sleep(5)
@@ -158,7 +167,7 @@ async def handle_screen_ws(websocket: WebSocket) -> None:
                 pass
 
         screening_task = asyncio.create_task(
-            manager.screen_and_subscribe(settings, params, on_symbol_done=on_symbol_done)
+            manager.screen_and_subscribe(settings, params, on_symbol_done=on_symbol_done, on_contract_found=on_contract_found)
         )
         disconnect_task = asyncio.create_task(wait_for_stop())
 
@@ -240,11 +249,11 @@ async def handle_listen_ws(websocket: WebSocket) -> None:
     async def watch_client():
         try:
             while True:
-                await websocket.receive_text()
-        except WebSocketDisconnect:
-            return
+                msg = await websocket.receive()
+                if msg["type"] == "websocket.disconnect":
+                    break
         except Exception:
-            return
+            pass
 
     async def heartbeat():
         import datetime

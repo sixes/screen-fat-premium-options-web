@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ScreenParams, ScreenResult, SymbolProgress, WsMessage } from "../types";
 
-export type SessionState = "connecting" | "screening" | "done" | "error";
+export type SessionState = "connecting" | "screening" | "stopping" | "done" | "error";
 
 export interface LogEntry {
   message: string;
@@ -38,9 +38,18 @@ export function useScreener() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
   const [heartbeat, setHeartbeat] = useState<Heartbeat | null>(null);
+  const [updatedSymbols, setUpdatedSymbols] = useState<Set<string>>(new Set());
+  const [newestFoundUnderlying, setNewestFoundUnderlying] = useState<string | null>(null);
+  const [subscribedUnderlyings, setSubscribedUnderlyings] = useState<Set<string>>(new Set());
+  const [pendingRemovalUnderlyings, setPendingRemovalUnderlyings] = useState<Set<string>>(new Set());
   const wsMapRef = useRef<Map<string, WebSocket>>(new Map());
   const activeUnderlyingsRef = useRef<Set<string>>(new Set());
   const listenerRef = useRef<WebSocket | null>(null);
+  const flashTimeoutsRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  const autofocusedUnderlyings = useRef<Set<string>>(new Set());
+  const pendingRestartRef = useRef<Map<string, ScreenParams>>(new Map());
+  // Self-reference for startScreening (assigned after definition, used in async callbacks)
+  const startScreeningRef = useRef<(params: ScreenParams) => void>(null!);
 
   const results = Array.from(resultsMap.values());
 
@@ -92,13 +101,6 @@ export function useScreener() {
 
   const removeUnderlying = useCallback((underlying: string) => {
     activeUnderlyingsRef.current.delete(underlying);
-    setResultsMap((prev) => {
-      const next = new Map(prev);
-      for (const [sym, r] of prev.entries()) {
-        if (r.underlying === underlying) next.delete(sym);
-      }
-      return next;
-    });
     setSessions((prev) => {
       const next = new Map(prev);
       for (const [id, s] of prev.entries()) {
@@ -135,6 +137,32 @@ export function useScreener() {
               next.set(msg.result.symbol, msg.result);
               return next;
             });
+            setUpdatedSymbols((prev) => {
+              const next = new Set(prev);
+              next.add(msg.result.symbol);
+              return next;
+            });
+            {
+              const sym = msg.result.symbol;
+              const existing = flashTimeoutsRef.current.get(sym);
+              if (existing) clearTimeout(existing);
+              const timer = setTimeout(() => {
+                setUpdatedSymbols((prev) => {
+                  const next = new Set(prev);
+                  next.delete(sym);
+                  return next;
+                });
+                flashTimeoutsRef.current.delete(sym);
+              }, 1000);
+              flashTimeoutsRef.current.set(sym, timer);
+            }
+            break;
+          case "remove":
+            setResultsMap((prev) => {
+              const next = new Map(prev);
+              next.delete(msg.symbol);
+              return next;
+            });
             break;
           case "underlying_subscribed":
             setResultsMap((prev) => {
@@ -142,9 +170,26 @@ export function useScreener() {
               for (const r of msg.results) next.set(r.symbol, r);
               return next;
             });
+            setSubscribedUnderlyings((prev) => {
+              const next = new Set(prev);
+              next.add(msg.underlying);
+              return next;
+            });
             break;
           case "underlying_removed":
             removeUnderlying(msg.underlying);
+            setSubscribedUnderlyings((prev) => {
+              const next = new Set(prev);
+              next.delete(msg.underlying);
+              return next;
+            });
+            {
+              const rp = pendingRestartRef.current.get(msg.underlying);
+              if (rp) {
+                pendingRestartRef.current.delete(msg.underlying);
+                startScreeningRef.current(rp);
+              }
+            }
             break;
           case "underlying_no_results":
             activeUnderlyingsRef.current.delete(msg.underlying);
@@ -187,6 +232,9 @@ export function useScreener() {
             for (const r of state.results) next.set(r.symbol, r);
             return next;
           });
+        }
+        if (state.subscribed_underlyings.length > 0) {
+          setSubscribedUnderlyings(new Set(state.subscribed_underlyings));
         }
         const byUnderlying = new Map<string, ScreenResult[]>();
         for (const r of state.results) {
@@ -286,6 +334,18 @@ export function useScreener() {
       const msg: WsMessage = JSON.parse(event.data);
 
       switch (msg.type) {
+        case "contract_found":
+          setResultsMap((prev) => {
+            const next = new Map(prev);
+            next.set(msg.result.symbol, msg.result);
+            return next;
+          });
+          if (!autofocusedUnderlyings.current.has(msg.result.underlying)) {
+            autofocusedUnderlyings.current.add(msg.result.underlying);
+            setNewestFoundUnderlying(msg.result.underlying);
+          }
+          break;
+
         case "started":
           updateSession(id, (s) => {
             const progress = new Map(s.progress);
@@ -354,6 +414,14 @@ export function useScreener() {
             next.delete(id);
             return next;
           });
+          wsMapRef.current.delete(id);
+          for (const sym of toScreen) {
+            const rp = pendingRestartRef.current.get(sym);
+            if (rp) {
+              pendingRestartRef.current.delete(sym);
+              startScreeningRef.current(rp);
+            }
+          }
           break;
 
         case "error":
@@ -370,6 +438,25 @@ export function useScreener() {
 
     ws.onclose = () => {
       wsMapRef.current.delete(id);
+      // If WS closed without "stopped" (e.g. network error during stopping), force cleanup
+      setSessions((prev) => {
+        const session = prev.get(id);
+        if (!session) return prev;
+        if (session.state === "stopping" || session.state === "connecting" || session.state === "screening") {
+          removeSymbolsFromActive(toScreen);
+          const next = new Map(prev);
+          next.delete(id);
+          return next;
+        }
+        return prev;
+      });
+      for (const sym of toScreen) {
+        const rp = pendingRestartRef.current.get(sym);
+        if (rp) {
+          pendingRestartRef.current.delete(sym);
+          startScreeningRef.current(rp);
+        }
+      }
     };
   }, []);
 
@@ -385,12 +472,9 @@ export function useScreener() {
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send("stop");
       }
-      removeSymbolsFromActive(session.symbols);
-      setSessions((prev) => {
-        const next = new Map(prev);
-        next.delete(id);
-        return next;
-      });
+      // Mark as stopping; the "stopped" WS message will do the final cleanup.
+      // This prevents the Restart button from appearing before the backend confirms cancellation.
+      updateSession(id, (s) => ({ ...s, state: "stopping" }));
     } else if (!hasSubscriptions) {
       // Empty result session — just dismiss locally, nothing to unsubscribe
       removeSymbolsFromActive(session.symbols);
@@ -399,8 +483,17 @@ export function useScreener() {
         next.delete(id);
         return next;
       });
+      // No WS or listener callback will fire, so trigger pending restarts immediately
+      for (const sym of session.symbols) {
+        const rp = pendingRestartRef.current.get(sym);
+        if (rp) {
+          pendingRestartRef.current.delete(sym);
+          startScreeningRef.current(rp);
+        }
+      }
     } else {
-      // Subscribed / done — unsubscribe via REST
+      // Subscribed / done — mark as stopping so Restart stays hidden until confirmed
+      updateSession(id, (s) => ({ ...s, state: "stopping" }));
       for (const underlying of session.symbols) {
         try {
           await fetch(`/api/unsubscribe/${underlying}`, { method: "POST" });
@@ -408,7 +501,7 @@ export function useScreener() {
           console.error(`Unsubscribe failed for ${underlying}:`, e);
         }
       }
-      // The listener WS will receive underlying_removed and clean up state
+      // The listener WS will receive underlying_removed → removeUnderlying + trigger pending restart
     }
   }, [sessions]);
 
@@ -419,14 +512,43 @@ export function useScreener() {
     }
   }, [sessions, stopSession]);
 
+  const stopUnderlying = useCallback(async (underlying: string) => {
+    try {
+      await fetch(`/api/unsubscribe/${underlying}`, { method: "POST" });
+    } catch (e) {
+      console.error(`Unsubscribe failed for ${underlying}:`, e);
+    }
+  }, []);
+
+  const addPendingRestart = useCallback((underlying: string, params: ScreenParams) => {
+    pendingRestartRef.current.set(underlying, params);
+  }, []);
+
+  const clearUnderlying = useCallback((underlying: string) => {
+    setResultsMap((prev) => {
+      const next = new Map(prev);
+      for (const [sym, r] of prev.entries()) {
+        if (r.underlying === underlying) next.delete(sym);
+      }
+      return next;
+    });
+    autofocusedUnderlyings.current.delete(underlying);
+  }, []);
+
   const clearResults = useCallback(() => {
     setResultsMap(new Map());
     setLogs([]);
+    setNewestFoundUnderlying(null);
+    setSubscribedUnderlyings(new Set());
+    autofocusedUnderlyings.current.clear();
   }, []);
 
   const anyBusy = Array.from(sessions.values()).some(
     (s) => s.state === "connecting" || s.state === "screening"
   );
+
+  // Keep ref in sync so async callbacks (WS handlers, etc.) can call the latest startScreening
+  startScreeningRef.current = startScreening;
 
   return {
     sessions: Array.from(sessions.values()),
@@ -436,8 +558,14 @@ export function useScreener() {
     totalSubscribed,
     notice,
     heartbeat,
+    updatedSymbols,
+    newestFoundUnderlying,
+    subscribedUnderlyings,
     startScreening,
     stopSession,
+    stopUnderlying,
+    addPendingRestart,
+    clearUnderlying,
     stopAll,
     clearResults,
   };

@@ -13,6 +13,7 @@ from app.models import OptionContract, ScreenResult
 logger = logging.getLogger(__name__)
 
 SymbolDoneCallback = Callable[[str, list[ScreenResult], float], Awaitable[None]]
+ContractFoundCallback = Callable[[ScreenResult], Awaitable[None]]
 
 
 async def _screen_symbol(
@@ -20,6 +21,7 @@ async def _screen_symbol(
     params: ScreenParams,
     symbol: str,
     on_symbol_done: SymbolDoneCallback | None = None,
+    on_contract_found: ContractFoundCallback | None = None,
 ) -> list[ScreenResult]:
     symbol_start = time.perf_counter()
     symbol_results: list[ScreenResult] = []
@@ -50,9 +52,13 @@ async def _screen_symbol(
                 if params.pre_market:
                     results = await _premarket_expiry(client, params, symbol, price, candles, expiry)
                     symbol_results.extend(results)
+                    if on_contract_found:
+                        for r in results:
+                            await on_contract_found(r)
                 else:
                     iv_rank_value, contracts_results, abort = await _screen_expiry(
-                        client, params, symbol, price, candles, expiry, iv_rank_value
+                        client, params, symbol, price, candles, expiry, iv_rank_value,
+                        on_contract_found=on_contract_found,
                     )
                     symbol_results.extend(contracts_results)
                     if abort:
@@ -142,6 +148,7 @@ async def _screen_expiry(
     candles: list[dict],
     expiry,
     iv_rank_value: float | None,
+    on_contract_found: ContractFoundCallback | None = None,
 ) -> tuple[float | None, list[ScreenResult], bool]:
     chain = await client.get_option_chain(f"{symbol}.US", expiry)
     if not chain:
@@ -171,7 +178,11 @@ async def _screen_expiry(
         if iv_rank_value is not None and iv_rank_value < params.min_iv_rank:
             return iv_rank_value, [], True
 
-    return iv_rank_value, _filter_contracts(params, contracts, iv_rank_value), False
+    results = _filter_contracts(params, contracts, iv_rank_value)
+    if on_contract_found:
+        for r in results:
+            await on_contract_found(r)
+    return iv_rank_value, results, False
 
 
 def _filter_contracts(
@@ -255,13 +266,14 @@ async def run_screening(
     client: LongBridgeClient,
     params: ScreenParams,
     on_symbol_done: SymbolDoneCallback | None = None,
+    on_contract_found: ContractFoundCallback | None = None,
 ) -> list[ScreenResult]:
     if params.pre_market:
         params.min_otm = params.min_otm / 3.0
         params.max_abs_delta = params.max_abs_delta * 3.0
 
     tasks = [
-        _screen_symbol(client, params, symbol, on_symbol_done=on_symbol_done)
+        _screen_symbol(client, params, symbol, on_symbol_done=on_symbol_done, on_contract_found=on_contract_found)
         for symbol in params.symbols
     ]
     per_symbol_results = await asyncio.gather(*tasks)

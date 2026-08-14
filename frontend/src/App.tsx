@@ -1,4 +1,4 @@
-import { useRef, useCallback } from "react";
+import { useRef, useCallback, useMemo } from "react";
 import { ScreenerForm } from "./components/ScreenerForm";
 import { ProgressBar } from "./components/ProgressBar";
 import { ResultsTable } from "./components/ResultsTable";
@@ -16,11 +16,36 @@ function App() {
     totalSubscribed,
     notice,
     heartbeat,
+    updatedSymbols,
+    newestFoundUnderlying,
+    subscribedUnderlyings,
     startScreening,
     stopSession,
+    stopUnderlying,
+    addPendingRestart,
+    clearUnderlying,
     stopAll,
     clearResults,
   } = useScreener();
+
+  // Derive per-underlying screening status from active sessions
+  const screeningStatus = useMemo(() => {
+    const map = new Map<string, "pending" | "screening" | "stopping">();
+    for (const session of sessions) {
+      if (session.state === "stopping") {
+        for (const sym of session.symbols) map.set(sym, "stopping");
+      } else if (session.progress.size === 0) {
+        for (const sym of session.symbols) map.set(sym, "pending");
+      } else {
+        for (const [sym, p] of session.progress) {
+          if (p.status === "screening" || p.status === "pending") {
+            map.set(sym, p.status);
+          }
+        }
+      }
+    }
+    return map;
+  }, [sessions]);
 
   const paramsRef = useRef<Omit<ScreenParams, "symbols">>({
     side: "put",
@@ -46,6 +71,30 @@ function App() {
   const handleScreenAgain = useCallback((symbol: string) => {
     startScreening({ ...paramsRef.current, symbols: [symbol] });
   }, [startScreening]);
+
+  const handleRestart = useCallback((underlying: string) => {
+    clearUnderlying(underlying);
+    const session = sessions.find((s) => s.symbols.includes(underlying));
+    const params = { ...paramsRef.current, symbols: [underlying] };
+    if (session && session.state !== "stopping") {
+      // Queue restart to fire after backend confirms the stop/unsubscribe
+      addPendingRestart(underlying, params);
+      stopSession(session.id);
+    } else if (!session) {
+      // No session — symbol is fully cleaned up, start directly
+      startScreening(params);
+    }
+    // If state is already "stopping", addPendingRestart was already called; do nothing
+  }, [clearUnderlying, sessions, addPendingRestart, stopSession, startScreening]);
+
+  const handleStop = useCallback((underlying: string) => {
+    const session = sessions.find((s) => s.symbols.includes(underlying));
+    if (session) {
+      stopSession(session.id);
+    } else {
+      stopUnderlying(underlying);
+    }
+  }, [sessions, stopSession, stopUnderlying]);
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -100,7 +149,15 @@ function App() {
 
         <LogPanel logs={logs} />
 
-        <ResultsTable results={results} />
+        <ResultsTable
+          results={results}
+          updatedSymbols={updatedSymbols}
+          newestFoundUnderlying={newestFoundUnderlying}
+          screeningStatus={screeningStatus}
+          subscribedUnderlyings={subscribedUnderlyings}
+          onStop={handleStop}
+          onRestart={handleRestart}
+        />
       </main>
 
       <BackToTop heartbeat={heartbeat} totalSubscribed={totalSubscribed} />

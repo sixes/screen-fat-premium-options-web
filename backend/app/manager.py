@@ -6,7 +6,7 @@ from typing import Any
 
 from app.config import ScreenParams, Settings
 from app.longbridge_client import LongBridgeClient
-from app.metrics import annualized_return, expected_value, probability_of_profit
+from app.metrics import annualized_return, expected_value, is_liquid, probability_of_profit
 from app.models import ScreenResult
 from app.screener import run_screening
 
@@ -28,6 +28,7 @@ class SubscriptionManager:
         self._client_lock = asyncio.Lock()
         self._underlying_locks: dict[str, asyncio.Lock] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._params_by_underlying: dict[str, ScreenParams] = {}
 
     async def ensure_client(self, settings: Settings) -> LongBridgeClient:
         async with self._client_lock:
@@ -55,12 +56,11 @@ class SubscriptionManager:
 
     def _broadcast(self, msg: dict[str, Any]) -> None:
         loop = self._loop
+        if loop is None:
+            return
         for q in list(self._listeners):
             try:
-                if loop is not None and asyncio.get_event_loop_policy().get_event_loop() is not loop:
-                    loop.call_soon_threadsafe(q.put_nowait, msg)
-                else:
-                    q.put_nowait(msg)
+                loop.call_soon_threadsafe(q.put_nowait, msg)
             except Exception:
                 pass
 
@@ -89,7 +89,7 @@ class SubscriptionManager:
 
         mid = (bid + ask) / 2 if (bid + ask) > 0 else 0.0
         result = self.results.get(symbol)
-        if result is None or mid <= 0:
+        if result is None:
             return
         if bid == result.bid and ask == result.ask:
             return
@@ -110,6 +110,17 @@ class SubscriptionManager:
         result.collateral = collateral
         result.expected_value = expected_value(pop_val, mid, collateral)
 
+        # Re-evaluate against stored filter params; remove contract if it no longer qualifies
+        params = self._params_by_underlying.get(result.underlying)
+        if params is not None:
+            liquid, _ = is_liquid(bid, ask, result.open_interest,
+                                  min_open_interest=params.min_open_interest,
+                                  max_spread_ratio=params.max_spread_ratio)
+            if not liquid or (ann_ret is not None and ann_ret < params.min_annual_return):
+                self.results.pop(symbol, None)
+                self._broadcast({"type": "remove", "symbol": symbol})
+                return
+
         self._broadcast({"type": "update", "result": result.to_dict()})
 
     async def screen_and_subscribe(
@@ -117,6 +128,7 @@ class SubscriptionManager:
         settings: Settings,
         params: ScreenParams,
         on_symbol_done=None,
+        on_contract_found=None,
     ) -> tuple[list[str], list[str]]:
         """Screen only underlyings not already subscribed, add them to global state.
 
@@ -137,10 +149,14 @@ class SubscriptionManager:
             self.subscribed_underlyings.add(u)
             self._broadcast({"type": "underlying_screening", "underlying": u})
 
+        success = False
         try:
-            results = await run_screening(client, params, on_symbol_done=on_symbol_done)
+            results = await run_screening(client, params, on_symbol_done=on_symbol_done, on_contract_found=on_contract_found)
             for r in results:
                 self.results[r.symbol] = r
+            # Store params per underlying for live re-evaluation in depth callback
+            for u in to_screen:
+                self._params_by_underlying[u] = params
             contract_symbols = [r.symbol for r in results]
             if contract_symbols:
                 await client.subscribe_depth(contract_symbols)
@@ -153,6 +169,7 @@ class SubscriptionManager:
                 if not res:
                     # No matching contracts — release the claim so user can retry
                     self.subscribed_underlyings.discard(underlying)
+                    self._params_by_underlying.pop(underlying, None)
                     self._broadcast({
                         "type": "underlying_no_results",
                         "underlying": underlying,
@@ -165,12 +182,17 @@ class SubscriptionManager:
                         "count": len(res),
                         "results": [r.to_dict() for r in res],
                     })
+            success = True
             return to_screen, skipped
-        except Exception:
-            for u in to_screen:
-                self.subscribed_underlyings.discard(u)
-                self._broadcast({"type": "underlying_removed", "underlying": u})
-            raise
+        finally:
+            if not success:
+                # Release claims on any failure path, including asyncio.CancelledError
+                # (which BaseException-derived exception is NOT caught by `except Exception`).
+                for u in to_screen:
+                    if u in self.subscribed_underlyings:
+                        self.subscribed_underlyings.discard(u)
+                        self._params_by_underlying.pop(u, None)
+                        self._broadcast({"type": "underlying_removed", "underlying": u})
 
     async def unsubscribe_underlying(self, underlying: str) -> bool:
         if underlying not in self.subscribed_underlyings:
@@ -185,6 +207,7 @@ class SubscriptionManager:
         for sym in contracts:
             self.results.pop(sym, None)
         self.subscribed_underlyings.discard(underlying)
+        self._params_by_underlying.pop(underlying, None)
         self._broadcast({"type": "underlying_removed", "underlying": underlying})
         return True
 
